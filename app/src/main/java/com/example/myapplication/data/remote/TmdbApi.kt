@@ -6,8 +6,16 @@ import retrofit2.http.GET
 import retrofit2.http.Path
 import retrofit2.http.Query
 
+/*
+ * INTERVIEW | Networking Q2: How does Retrofit execute `suspend` functions?
+ * Retrofit 2.6+ natively supports coroutines. When it sees a `suspend` modifier, it checks
+ * for a `Continuation` parameter and uses `suspendCancellableCoroutine` under the hood —
+ * registering an OkHttp callback and calling `continuation.resume(response)` on success or
+ * `continuation.resumeWithException(e)` on failure.
+ * You do NOT need `withContext(Dispatchers.IO)` — Retrofit handles thread dispatch internally.
+ */
 interface TmdbApi {
-    
+
     @GET("movie/popular")
     suspend fun getPopularMovies(
         @Query("page") page: Int = 1

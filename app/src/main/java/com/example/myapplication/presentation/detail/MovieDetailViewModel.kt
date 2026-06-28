@@ -28,6 +28,14 @@ class MovieDetailViewModel @Inject constructor(
     private val _state = MutableStateFlow(MovieDetailState())
     val state: StateFlow<MovieDetailState> = _state.asStateFlow()
 
+    /*
+     * INTERVIEW | Navigation Q2: SavedStateHandle & System Process Death
+     * Navigation arguments passed in the route ("detail/{movie_id}") are automatically bundled
+     * into SavedStateHandle by Hilt. If Android kills the process (to reclaim memory while the
+     * app is backgrounded) and the user returns, the system reconstructs the Activity stack and
+     * ViewModels. SavedStateHandle survives this process death, restoring "movie_id" so the ViewModel
+     * can re-query the repository and restore UI state without crashing.
+     */
     init {
         savedStateHandle.get<Int>("movie_id")?.let { id ->
             loadMovieDetails(id)
@@ -38,6 +46,12 @@ class MovieDetailViewModel @Inject constructor(
         viewModelScope.launch {
             _state.update { it.copy(isLoading = true, error = null) }
             
+            // INTERVIEW | Navigation Q4: Cache-First, Network-Second pattern
+            // 1. Read from Room cache immediately so the user sees a styled screen with no blank
+            //    page while the network request is in-flight.
+            // 2. Fire the network request for full details (runtime, genres) not in the list cache.
+            // 3. Merge the network result into UI state; on failure, show a non-blocking error
+            //    badge and keep the cached data visible.
             // 1. Fetch from Room cache first so UI renders instantly
             val cachedMovie = repository.getMovieFromCache(id)
             if (cachedMovie != null) {

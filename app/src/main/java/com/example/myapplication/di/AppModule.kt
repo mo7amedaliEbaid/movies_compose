@@ -21,6 +21,20 @@ import retrofit2.Retrofit
 import retrofit2.converter.kotlinx.serialization.asConverterFactory
 import javax.inject.Singleton
 
+/*
+ * INTERVIEW | DI Q3: Hilt Scopes — @Singleton vs Unscoped
+ * Every @Provides function here is annotated @Singleton, meaning Hilt creates the dependency
+ * once inside SingletonComponent (lives as long as the Application) and shares that same
+ * instance everywhere it is injected. Without @Singleton, Hilt would create a NEW instance
+ * on every injection. Over-using scopes keeps objects in memory longer than needed, so only
+ * scope objects that hold shared state or manage expensive resources (DB, network client).
+ *
+ * INTERVIEW | DI Q2: @Provides vs @Binds
+ * We use @Provides (not @Binds) throughout this module because we own the instantiation logic:
+ * we configure OkHttp, Json, and Retrofit before creating them. @Binds would be a more
+ * efficient alternative for simple interface→implementation bindings (e.g. MovieRepository),
+ * but it requires an abstract class and @Inject constructor on the implementation.
+ */
 @Module
 @InstallIn(SingletonComponent::class)
 object AppModule {
@@ -32,6 +46,14 @@ object AppModule {
             level = HttpLoggingInterceptor.Level.BODY
         }
 
+        /*
+         * INTERVIEW | Networking Q4: API Key Security — local.properties / BuildConfig
+         * The key is read from local.properties (git-ignored) and compiled into BuildConfig.
+         * LIMITATION: It is stored as a plaintext String inside the APK. A decompiler (JADX)
+         * can extract it in seconds.
+         * Production mitigations: (1) ProGuard string obfuscation, (2) NDK native .so files,
+         * (3) Backend Proxy — the app calls YOUR server which holds the TMDB key server-side.
+         */
         val authInterceptor = Interceptor { chain ->
             val originalRequest = chain.request()
             val newRequest = originalRequest.newBuilder()
@@ -51,6 +73,14 @@ object AppModule {
     @Provides
     @Singleton
     fun provideTmdbApi(okHttpClient: OkHttpClient): TmdbApi {
+        /*
+         * INTERVIEW | Networking Q5: ignoreUnknownKeys = true
+         * By default Kotlinx Serialization throws SerializationException for any JSON key not
+         * declared in the DTO. Setting ignoreUnknownKeys = true makes the parser skip unknown
+         * fields silently. This is critical for stability: public APIs like TMDB frequently add
+         * new keys, and without this flag a minor backend change would crash all existing app
+         * versions in production.
+         */
         val json = Json {
             ignoreUnknownKeys = true
             coerceInputValues = true

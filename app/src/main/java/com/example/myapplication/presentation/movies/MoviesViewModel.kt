@@ -18,6 +18,19 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import javax.inject.Inject
 
+/*
+ * INTERVIEW | DI Q4: Why @HiltViewModel?
+ * Normally, to pass constructor args (like a repository) to a ViewModel you must write a custom
+ * ViewModelProvider.Factory. @HiltViewModel tells the Hilt compiler to auto-generate that factory.
+ * Hilt wires the ViewModelComponent so all @Inject constructor dependencies are resolved, then
+ * you retrieve it via hiltViewModel() in Compose or `by viewModels()` in an Activity.
+ *
+ * INTERVIEW | DI Q5: StateFlow vs SharedFlow
+ * StateFlow: requires an initial value, holds the LATEST state, conflates equal consecutive
+ *   values (no re-emit if unchanged). Ideal for UI state holders like MoviesState.
+ * SharedFlow: no initial value, emits every value (even duplicates), configurable replay buffer.
+ *   Best for one-time events — Snackbar, navigation actions, sound playback.
+ */
 @OptIn(FlowPreview::class)
 @HiltViewModel
 class MoviesViewModel @Inject constructor(
@@ -32,6 +45,13 @@ class MoviesViewModel @Inject constructor(
 
     init {
         // 1. Observe local Room Database flow
+        // INTERVIEW | Caching Q5: Preventing resource leaks from Flow collection in ViewModel
+        // .launchIn(viewModelScope) ties the collection to viewModelScope. When the ViewModel is
+        // cleared (Activity/Fragment finishes), viewModelScope is automatically cancelled,
+        // cancelling the Flow subscription and preventing memory leaks.
+        // In Composables, prefer collectAsStateWithLifecycle() (lifecycle-runtime-compose) over
+        // collectAsState() — it pauses collection when the lifecycle drops below STARTED (app
+        // backgrounds), saving CPU cycles and resuming automatically on foreground.
         repository.getPopularMovies()
             .onEach { popularList ->
                 cachedMovies = popularList
@@ -43,6 +63,13 @@ class MoviesViewModel @Inject constructor(
             .launchIn(viewModelScope)
 
         // 2. Observe search query with 500ms debounce
+        // INTERVIEW | Navigation Q3: Input debouncing with Kotlin Flows
+        // debounce(500): if a new value arrives before 500ms elapses, the previous is discarded
+        //   and the timer resets. Only the final value after a pause triggers the search.
+        // distinctUntilChanged(): suppresses re-emission of the same value — e.g., typing "a",
+        //   backspacing and re-typing "a" within the debounce window won't fire a duplicate call.
+        // Benefits: saves network bandwidth, reduces server load, prevents race conditions where
+        //   a slower older query response arrives after a newer one.
         viewModelScope.launch {
             _searchQueryFlow
                 .debounce(500)

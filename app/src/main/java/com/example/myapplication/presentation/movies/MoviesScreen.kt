@@ -34,6 +34,16 @@ import com.example.myapplication.data.remote.TmdbApi
 import com.example.myapplication.domain.model.Movie
 import com.example.myapplication.ui.components.shimmer
 
+/*
+ * INTERVIEW | Compose Q1: What is recomposition, and how does Compose optimize it?
+ * Recomposition is re-executing Composable functions with new data. Compose optimizes via:
+ * 1. Intelligent skipping: if a Composable's inputs are stable and unchanged, Compose skips
+ *    executing it and its children entirely (based on structural equality checks).
+ * 2. Positional Memoization: Compose tracks each Composable's position in the tree and only
+ *    invalidates nodes whose backing state has changed.
+ * 3. Scoped recomposition: recomposition starts at the nearest scope that reads the modified
+ *    state — it doesn't re-run the entire tree, only the affected subtree.
+ */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun MoviesScreen(
@@ -43,6 +53,18 @@ fun MoviesScreen(
     val state by viewModel.state.collectAsState()
     val listState = rememberLazyGridState()
 
+    // INTERVIEW | Compose Q4: derivedStateOf
+    // Use derivedStateOf when a source state changes FREQUENTLY but the derived output only
+    // changes OCCASIONALLY. Here, visibleItemsInfo updates on every pixel scrolled (100+/sec).
+    // Without derivedStateOf, every pixel scroll would trigger a recomposition of the whole
+    // screen. With derivedStateOf, Compose only recomposes when shouldLoadNextPage flips
+    // between true and false — a massive performance optimization.
+    //
+    // INTERVIEW | Compose Q3: remember vs rememberSaveable
+    // remember: caches the value across recompositions but is LOST on configuration change or
+    //   process death (the Composition tree is destroyed and recreated).
+    // rememberSaveable: persists through config changes and system process death via Bundle.
+    //   Stored type must be a primitive, Parcelable, or have a custom Saver.
     // Infinite scroll trigger: when the user scrolls near the end of the loaded items
     val shouldLoadNextPage by remember {
         derivedStateOf {
@@ -52,6 +74,14 @@ fun MoviesScreen(
         }
     }
 
+    // INTERVIEW | Compose Q5: LaunchedEffect vs SideEffect vs DisposableEffect
+    // LaunchedEffect(key): runs a suspend block when entering Composition or when `key` changes.
+    //   Cancels the coroutine on leave or key change. Ideal for: network calls, DB reads,
+    //   animations triggered on screen entry.
+    // DisposableEffect(key): runs a non-suspend block on entry; MUST end with onDispose{} to
+    //   unregister observers, listeners, or sensors when leaving Composition or on key change.
+    // SideEffect: runs on EVERY successful recomposition. Use to sync Compose state with
+    //   non-Compose code (e.g., Analytics trackers, system views).
     LaunchedEffect(shouldLoadNextPage) {
         if (shouldLoadNextPage) {
             viewModel.loadNextPage()

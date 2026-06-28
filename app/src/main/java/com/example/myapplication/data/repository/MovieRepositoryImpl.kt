@@ -37,6 +37,13 @@ class MovieRepositoryImpl(
             )
         }
         
+        /*
+         * INTERVIEW | Caching Q3: withTransaction vs runInTransaction
+         * runInTransaction is a blocking function — calling it from the main thread causes ANR.
+         * withTransaction is a suspend extension function that handles suspension internally,
+         * executing the transaction asynchronously without blocking the calling coroutine's thread.
+         * Always use withTransaction in modern Kotlin-coroutine Android apps.
+         */
         db.withTransaction {
             if (page == 1) {
                 dao.clearAllMovies()

@@ -35,6 +35,15 @@ class MainActivity : ComponentActivity() {
                         MoviesScreen(
                             viewModel = viewModel,
                             onMovieClick = { movie ->
+                                // INTERVIEW | Navigation Q1: Why pass only the ID, not the full Movie object?
+                                // 1. Route Semantics: Navigation routes are URL-like. Embedding complex
+                                //    objects requires URL encoding, which is brittle and adds overhead.
+                                // 2. Single Source of Truth: passing the full object gives Screen B a
+                                //    stale snapshot. If the movie's data changes (favorite toggled, rating
+                                //    updated), Screen B won't reflect it. Passing only the ID forces the
+                                //    detail ViewModel to fetch fresh data from the repository.
+                                // 3. Memory: large objects in the backstack Bundle can cause
+                                //    TransactionTooLargeException if the system saves state.
                                 navController.navigate("detail/${movie.id}")
                             }
                         )
