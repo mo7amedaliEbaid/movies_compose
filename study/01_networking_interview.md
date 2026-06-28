@@ -1,64 +1,185 @@
-# Android Technical Interview Prep: Networking & Serialization
+# Deep-Dive Interview: Networking & Serialization
 
-This guide outlines common interview questions, explanations, and key talking points related to networking, JSON parsing, API key security, and architectural data mapping.
-
----
-
-### Q1: Why should we separate API models (DTOs) from UI/Domain models?
-**Answer:**
-1. **Separation of Concerns & Single Responsibility Principle (SRP):** DTOs represent the structure expected by the backend API. UI or Domain models represent the structure expected by our application logic and user interface.
-2. **Resilience to API changes:** If the API structure changes (e.g., snake_case changes to camelCase, or field names are modified), we only modify the annotations or mapping functions in the data layer. The domain and presentation layers remain unaffected.
-3. **Optimizing UI consumption:** DTO fields are often typed as raw strings (e.g., date formats, status strings) or contain nullable properties. During the mapping process (`toDomain()`), we can parse dates, provide default safe values, or map strings into strongly-typed Kotlin `enums` or `sealed classes`.
-4. **Decoupled from Framework/Library dependencies:** If we decide to migrate from Kotlinx Serialization to Moshi or Gson, we only have to change serialization annotations on the DTO class. The domain models are pure Kotlin classes with zero annotations.
-
-**Key Coding Phrase for Interview:**
-> *"Using mapping functions like `toDomain()` acts as an anti-corruption layer (ACL), keeping library dependencies and backend schemas isolated in the data layer."*
+These questions are designed to separate someone who *memorized* the layers from
+someone who actually understands the runtime behavior, failure modes, and trade-offs.
+Every question is grounded in the real code in this repo. Each item lists **what it
+probes**, a **strong answer**, **follow-up probes** to go deeper, and the **red flag**
+shallow answer to listen for.
 
 ---
 
-### Q2: How does Retrofit execute `suspend` functions under the hood?
-**Answer:**
-Starting with Retrofit 2.6.0, Retrofit natively supports Kotlin coroutines. 
-1. When you declare a function with the `suspend` modifier, Retrofit uses Kotlin reflection (specifically, checking if the last parameter of the method is of type `kotlin.coroutines.Continuation`).
-2. Retrofit executes the call asynchronously using its standard OkHttp client dispatcher.
-3. Instead of blocking the calling thread, it registers a callback (similar to `enqueue()`) and uses `suspendCancellableCoroutine` to yield the thread execution.
-4. When the response arrives:
-   - If the network call is successful, Retrofit calls `continuation.resume(response)` returning the parsed body.
-   - If the network call fails or throws an exception, it calls `continuation.resumeWithException(exception)`.
-5. Importantly, Retrofit handles the suspension and thread dispatching internally, meaning you do **not** need to wrap Retrofit suspend calls in `withContext(Dispatchers.IO)`.
+### Q1: Walk me through *exactly* what happens to a coroutine — frame by frame — when `api.getPopularMovies(page)` suspends. Who frees the thread, and what resumes it?
+
+**What it probes:** Whether the candidate understands CPS transformation and Retrofit's
+suspend adapter, or just parrots "coroutines are lightweight threads."
+
+**Strong answer:**
+- The Kotlin compiler rewrites the enclosing `suspend` function into a state machine. Each
+  suspension point becomes a label; locals are hoisted into a generated `Continuation`
+  object that captures the call frame.
+- At the call site, Retrofit's suspend adapter wraps the OkHttp `Call` in
+  `suspendCancellableCoroutine`. It calls `enqueue()` (async), then *returns* `COROUTINE_SUSPENDED`.
+  Returning that sentinel is what actually releases the thread back to the dispatcher — the
+  stack unwinds, the thread is free to run other work.
+- No thread is blocked while the socket is waiting. OkHttp's own dispatcher thread owns the
+  in-flight request.
+- When the HTTP response arrives, OkHttp invokes the callback on its dispatcher thread, which
+  calls `continuation.resume(body)` (or `resumeWithException`). That re-dispatches the
+  continuation back onto the original coroutine's dispatcher (`viewModelScope` → `Dispatchers.Main.immediate`)
+  to resume at the saved label.
+
+**Follow-up probes:**
+- *"So which thread does the JSON parsing happen on?"* → OkHttp's background thread (inside the
+  converter), not Main. That's why no `withContext(Dispatchers.IO)` is needed.
+- *"If I cancel `viewModelScope` mid-flight, does the socket connection get cancelled?"* → Yes —
+  `suspendCancellableCoroutine` registers an `invokeOnCancellation` that calls `call.cancel()`.
+  Cancellation is cooperative and propagates to OkHttp. A shallow candidate thinks cancellation
+  only stops the coroutine but leaks the socket.
+
+**Red flag:** "Retrofit runs it on a background thread with `withContext`." It does not — and not
+knowing *who* resumes the continuation means they've memorized the slogan, not the mechanism.
 
 ---
 
-### Q3: What is the difference between Kotlinx Serialization and Gson? Why choose one over the other?
-**Answer:**
+### Q2: This app catches `catch (e: Exception)` in the ViewModel. A TMDB call can fail in at least three structurally different ways. Enumerate them and explain why a single generic catch is a design smell.
 
-| Feature | Kotlinx Serialization | Gson |
-| :--- | :--- | :--- |
-| **Compilation** | **Compiler plugin-based**. Code generation happens at compile-time. | **Reflection-based**. Parses objects at runtime. |
-| **Performance** | Extremely fast. Zero runtime reflection overhead. | Slower, especially for large JSONs, due to extensive reflection. |
-| **Kotlin Type Safety** | Fully respects Kotlin properties, default values, and nullability. | Bypasses constructors using `UnsafeAllocator`. Can write `null` into non-nullable Kotlin types, causing runtime crashes. |
-| **Platform support** | Kotlin Multiplatform (KMP) ready (Android, iOS, JVM, JS). | JVM/Android only. |
+**What it probes:** Real-world error taxonomy vs. "wrap it in try/catch."
 
-**Important Warning to Mention:**
-> *"Gson does not check Kotlin nullability rules. If a JSON key is missing and the Kotlin property is non-nullable without a default value, Gson will inject `null` anyway via JVM reflection. This results in a NullPointerException when you access the field. Kotlinx Serialization guarantees type safety by respecting Kotlin's type system at compile time."*
+**Strong answer:** With a suspend Retrofit function that returns the body directly (not `Response<T>`):
+1. **`IOException`** — no network, DNS failure, timeout, socket reset. *Retryable / show "offline".*
+2. **`HttpException`** — a non-2xx response (401 bad key, 404 unknown movie, 429 rate-limited).
+   *Not retryable by simple retry; 429 needs backoff, 401 is a config bug.*
+3. **`SerializationException` / `MissingFieldException`** — the body parsed but didn't match the
+   DTO contract. *A client bug or breaking API change — retrying will never help.*
+4. (Plus `CancellationException`, which **must not** be swallowed — see follow-up.)
+
+A blanket `catch (Exception)` collapses all of these into one "error" string, so the UI can't
+distinguish "you're offline, retry" from "your API key is wrong" from "the app is broken." A
+mature design maps exceptions to a sealed `DataError`/`Result` type at the repository boundary.
+
+**Follow-up probes:**
+- *"What's wrong with `catch (e: Exception)` specifically in a coroutine?"* → It catches
+  `CancellationException` too. Swallowing it breaks structured concurrency: the coroutine keeps
+  running its catch/finally as if alive, and the parent thinks the child completed normally. You
+  should rethrow `CancellationException` (or catch the narrower types). **This repo's
+  ViewModels have this exact bug.**
+- *"Where should the mapping from exception → domain error live?"* → Data layer (repository), so
+  the domain/presentation never import `retrofit2.HttpException`.
+
+**Red flag:** "Exceptions are exceptions, the catch handles all of them." Misses cancellation and
+the retryable-vs-fatal distinction.
 
 ---
 
-### Q4: How do you handle TMDB API key security, and what are the limitations of storing it in `local.properties` / `BuildConfig`?
-**Answer:**
-We configure `local.properties` to ensure the API key is **not** pushed to public Git repositories. The Gradle script reads this file locally and injects it into `BuildConfig` at compile-time.
+### Q3: The DTO uses `coerceInputValues = true` *and* default values like `voteAverage: Double = 0.0`. Construct a JSON payload that still crashes deserialization despite both safety nets. Then explain the precise difference between what `ignoreUnknownKeys`, `coerceInputValues`, and defaults each protect against.
 
-**Limitations / Vulnerabilities:**
-Even if the API key is not in Git, compiling it into `BuildConfig` means it is stored as a plaintext String inside the final APK. A reverse engineer can easily decompile the APK using tools like **JADX** and extract the string in seconds.
+**What it probes:** Whether they understand these flags are orthogonal, not interchangeable.
 
-**Mitigations for production applications:**
-1. **Proguard / DexGuard Obfuscation:** Enable string obfuscation so keys aren't stored in cleartext.
-2. **NDK (Native Development Kit):** Store keys inside native C/C++ files (`.cpp`) and compile them into shared libraries (`.so`). This is harder to reverse-engineer but still not 100% secure.
-3. **Backend Proxy / API Gateway (Best Practice):** Instead of making direct calls to the TMDb API from the client app, the app should call a backend proxy server managed by your company. The proxy server stores the TMDb API key securely in its environment variables, appends it to requests, and forwards them. This keeps the API key completely hidden from the client application.
+**Strong answer:** A payload missing a **non-nullable field that has no default** — e.g. `title`
+is `val title: String` with no default. If the JSON omits `"title"`, kotlinx throws
+`MissingFieldException` regardless of the two flags. (Also: `"id": null` would fail because `id`
+is non-null with no default and `coerceInputValues` only coerces to a *declared default*, which
+`id` doesn't have.)
+
+The three mechanisms cover **different** failures:
+| Mechanism | Protects against | Does NOT help with |
+|---|---|---|
+| `ignoreUnknownKeys` | JSON has **extra** keys not in the DTO | Missing keys |
+| Default value (`= 0.0`) | JSON **omits** that key | `null` for a non-null type |
+| `coerceInputValues` | JSON sends **`null`** (or invalid enum) for a field **that has a default** → uses the default instead of crashing | Missing non-null field with no default |
+
+So `coerceInputValues` is only meaningful *in combination with* a default. A field with no
+default gets no protection from it.
+
+**Follow-up probes:**
+- *"`id` has no default. Is that intentional?"* → Yes — `id` is the primary key; you *want* a hard
+  failure if it's missing rather than silently coercing to 0 and corrupting the cache.
+- *"Why is making everything nullable-with-default a bad over-correction?"* → It pushes null
+  handling into every UI call site and hides genuine contract breaks behind silent zeros.
+
+**Red flag:** "Those flags make parsing never crash." Demonstrably false, and shows they treat
+config as magic.
 
 ---
 
-### Q5: What does `ignoreUnknownKeys = true` do in Kotlinx Serialization Json configuration? Why is it crucial?
-**Answer:**
-By default, Kotlinx Serialization is strict. If the JSON payload returned by the server contains keys that are not defined in the DTO class, the library will throw a `SerializationException` and crash.
-Setting `ignoreUnknownKeys = true` configures the parser to simply ignore any undocumented fields. This is crucial for app stability because public APIs (like TMDb) frequently add new keys to their endpoints. Without this setting, a minor API update from the backend team would instantly break existing versions of the app in production.
+### Q4: This module authenticates with a `Bearer` token header in an OkHttp interceptor, but the study guide describes a query-param `api_key` in `BuildConfig`. Compare the two TMDB auth schemes, and critique putting the token in an interceptor vs. an `@Query` parameter.
+
+**What it probes:** Reading the *actual* code, understanding interceptors, and security/observability trade-offs.
+
+**Strong answer:**
+- TMDB supports two schemes: a **v3 `api_key` query param** and a **v4 bearer access token** in
+  the `Authorization` header. This app uses the v4 bearer header via `authInterceptor`.
+- **Interceptor (header) advantages:** the secret is applied in exactly one place, never appears
+  in the URL, doesn't leak into logs/analytics/`Referer`, and isn't cached by proxies keyed on URL.
+- **`@Query` param disadvantages:** the key is in the URL → shows up in HTTP logs, server access
+  logs, and crash reports; it also pollutes the cache key.
+- **Critique of the interceptor here:** it's an *application* interceptor, so it runs once per
+  call but won't re-apply on redirects handled at the network layer; fine for this. The bigger
+  issue is ordering — `loggingInterceptor` is added *before* `authInterceptor`, so at
+  `Level.BODY` the logger won't see the `Authorization` header (auth is added after logging in
+  the chain)... actually it *will*, because both are application interceptors and the request is
+  rebuilt; the candidate should reason about chain order and that **BODY-level logging will print
+  the bearer token to Logcat in debug** — a real leak risk that should be gated behind
+  `BuildConfig.DEBUG`.
+
+**Follow-up probes:**
+- *"Regardless of header vs query, the token is still compiled into the APK. Rank the real-world
+  mitigations."* → Backend proxy (only true fix) > short-lived tokens fetched at runtime >
+  NDK/obfuscation (raise the bar, not a fix). `local.properties` only keeps it out of git; it
+  does nothing against decompilation.
+- *"Why is `HttpLoggingInterceptor.Level.BODY` dangerous in production?"* → Logs full bodies +
+  headers (including the token) to Logcat; should be `NONE` in release.
+
+**Red flag:** "We hide the key in `local.properties` so it's secure." Conflates git hygiene with
+runtime security.
+
+---
+
+### Q5: Trace a single `MovieDto` from the wire all the way to a `MovieEntity` row. Count the mappings, and identify the data that is silently *lost* on the way into the cache. Why is that a latent bug?
+
+**What it probes:** End-to-end data-flow thinking and spotting lossy mappings.
+
+**Strong answer:**
+- Path: JSON → `MovieDto` (kotlinx) → in `MovieRepositoryImpl.refreshPopularMovies`, mapped
+  *manually* into `MovieEntity` (a third, hand-written mapping that does **not** use `toDomain()`).
+- `MovieDto` and `Movie` carry `runtime` and `genres`, but **`MovieEntity` has neither field**, so
+  those are dropped when caching. The popular endpoint doesn't return them anyway, but
+  `getMovieDetails` does.
+- The latent bug: the detail screen is "cache-first" and reads `getMovieFromCache(id)?.toDomain()`,
+  but the cache can *never* hold `runtime`/`genres` because the entity can't store them — and
+  detail results are never written back to Room at all. So the cache is permanently a
+  partial projection, and there's a third, drift-prone mapping (`Dto→Entity`) maintained by hand
+  next to `Dto→Domain` and `Entity→Domain`.
+
+**Follow-up probes:**
+- *"How many representations of a movie exist and is that justified?"* → Four: `MovieDto`,
+  `Movie`, `MovieEntity`, plus the UI reading `Movie`. DTO↔Domain separation is justified
+  (anti-corruption layer); a separate `Entity` is justified *if* persistence needs differ — but
+  here it's nearly identical and just creates a hand-maintained mapping that already diverged
+  (missing runtime/genres). A `MovieEntity.fromDomain` exists but `refreshPopularMovies` ignores
+  it and re-maps inline — so the mappings can drift.
+- *"Fix?"* → Either store details in the entity (add columns + migration) and write detail
+  responses back to cache, or be explicit that the list cache is a summary projection and the
+  detail screen is network-only.
+
+**Red flag:** "It maps DTO to domain, clean architecture, done." Doesn't notice the silent field
+loss or the duplicated hand mapping.
+
+---
+
+### Q6: Why does this app need `MovieResponse` as a wrapper, and what does its existence tell you about pagination correctness elsewhere in the app?
+
+**What it probes:** Connecting the envelope DTO to the pagination logic.
+
+**Strong answer:** `MovieResponse` carries `page`, `total_pages`, `total_results` plus `results`.
+The app currently determines "reached end" for *popular* movies by streaming from Room and never
+sets `hasReachedEnd`, and for *search* by checking `results.isEmpty()`. But `total_pages` is the
+authoritative signal — the app ignores it. So pagination "knows" the API exposes totals yet
+relies on an emptiness heuristic, which fires one wasted request past the real end and can't
+short-circuit. A deep candidate notices the envelope is under-used.
+
+**Follow-up probes:**
+- *"Where would you thread `total_pages` to fix `loadNextPage`?"* → Repository returns it (or a
+  paged result type); ViewModel compares `currentPage >= totalPages`.
+
+**Red flag:** "It's just the JSON structure." True but misses that the metadata is being discarded.
