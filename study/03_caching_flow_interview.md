@@ -156,3 +156,197 @@ that movie's rating, the popular cache and the search snapshot disagree.
 
 **Red flag:** "Cache-first always shows instantly." Only true for cached ids; misses the
 search-result gap.
+
+---
+
+### Q7: `refreshPopularMovies` calls `api.getPopularMovies(page)` from a coroutine launched on `viewModelScope` (which defaults to `Dispatchers.Main`). Why doesn't this block the UI thread, and what would wrapping it in `withContext(Dispatchers.IO)` actually do?
+
+**What it probes:** Whether the candidate understands that suspend Retrofit calls don't block,
+or just cargo-cults `withContext(Dispatchers.IO)` for all "async" work.
+
+**Strong answer:**
+- `api.getPopularMovies(page)` is a `suspend` function. Retrofit's suspend adapter wraps the OkHttp
+  `Call` in `suspendCancellableCoroutine`, calls `enqueue()` asynchronously, then **returns
+  `COROUTINE_SUSPENDED`** — that sentinel is what releases the Main thread. The stack unwinds; the
+  thread is free. OkHttp's own dispatcher thread owns the in-flight request.
+- So wrapping with `withContext(Dispatchers.IO)` would jump to an IO thread, immediately suspend
+  on the network call (freeing *that* IO thread), wait, then jump back to Main. It adds two context
+  switches for zero benefit — the UI is never blocked in either case.
+- `withContext(Dispatchers.IO)` *is* needed for **truly blocking** calls: synchronous Java I/O
+  (`BufferedReader.readLines()`), `Thread.sleep()`, or any API that blocks the calling thread
+  rather than accepting a callback/continuation.
+- The Room DAO writes (`clearAllMovies`, `insertMovies`) are also `suspend` and dispatch
+  internally to Room's own executor — again, no manual `withContext` needed.
+
+**Follow-up probes:**
+- *"What's the difference between `Dispatchers.IO` and `Dispatchers.Default`?"* → IO is sized for
+  blocking work (up to 64 threads, or `kotlinx.coroutines.io.parallelism` system property); Default
+  is sized for CPU-bound work (one thread per CPU core). Both are background pools but tuned
+  differently. Using IO for CPU-heavy sorting wastes threads; using Default for blocking I/O starves it.
+- *"If a junior dev adds `withContext(Dispatchers.IO)` around the Retrofit call, does anything break?"*
+  → No visible breakage, but it adds latency (two thread hops) and misleads readers into thinking the
+  call *needs* it. It's a correctness-neutral but semantically wrong pattern.
+
+**Red flag:** "You always need `withContext(Dispatchers.IO)` for network calls in a coroutine."
+A very common cargo-cult — harmless for suspend Retrofit calls but shows they haven't traced *why*.
+
+---
+
+### Q8: `viewModelScope` is used across `MoviesViewModel` to launch `refreshMovies`, `loadNextPage`, and the search coroutine. If `loadNextPage` throws an uncaught exception, does it cancel the search coroutine? What internal `Job` type does `viewModelScope` use, and why?
+
+**What it probes:** Structured concurrency internals — `Job` vs `SupervisorJob`, and whether
+the candidate knows that `viewModelScope` isolates sibling failures.
+
+**Strong answer:**
+- `viewModelScope` is created internally by the AndroidX `ViewModel` extension with a
+  **`SupervisorJob`** (not a plain `Job`). In a `SupervisorJob` hierarchy, a child's failure does
+  **not** propagate upward to cancel the parent or siblings. So if `loadNextPage` throws and that
+  exception isn't caught inside the `launch` block, only *that* coroutine fails — the search and
+  refresh coroutines keep running.
+- With a plain `Job`, any child exception propagates up to the parent, which cancels *all* other
+  children — a single failure brings down the whole scope.
+- However, "survives" doesn't mean "silent": the uncaught exception is still delivered to any
+  installed `CoroutineExceptionHandler` on the scope, or rethrown on the Main thread if none
+  exists (potentially crashing the app). `SupervisorJob` isolates scope-level cancellation, not
+  unhandled crashes.
+
+**Follow-up probes:**
+- *"When would you deliberately create a scope with a plain `Job`?"* → When child operations are
+  tightly coupled: if step 1 fails, steps 2 and 3 are meaningless. A multi-step upload pipeline
+  where every stage depends on the previous one is a good case.
+- *"What's the difference between a `SupervisorJob` scope and using `supervisorScope { }` inside
+  a coroutine?"* → `supervisorScope` is a suspend function that creates a transient supervisor scope
+  for the duration of its block; it re-throws the *block's own* exception to the caller but doesn't
+  propagate children's failures to siblings. Good for parallel `async` calls where you want one
+  failure to not kill the others.
+
+**Red flag:** "`viewModelScope` uses a regular `Job` so one crash cancels everything." Wrong —
+it uses `SupervisorJob`. Reveals the candidate has never read the Jetpack lifecycle source.
+
+---
+
+### Q11: What is a coroutine?
+
+**What it probes:** Whether the candidate has a precise mental model or just repeats the
+"lightweight thread" slogan without understanding *what makes them light* or *how suspension
+actually works*.
+
+**Strong answer:** A coroutine is a unit of execution whose progress can be **suspended and
+resumed** without blocking the underlying thread. When a coroutine hits a suspension point
+(a `suspend` function that returns `COROUTINE_SUSPENDED`), the Kotlin runtime saves the
+call frame — locals, program counter, everything — into a heap-allocated `Continuation` object,
+then **returns the thread** to its pool. No thread is parked; no OS context switch happens. When
+the awaited work completes (a network response arrives, a timer fires), the `Continuation` is
+dispatched back onto the appropriate thread and execution resumes from the exact same point.
+
+This is why coroutines are lightweight compared to threads:
+- A **thread** is an OS resource: ~1 MB stack, kernel-managed scheduling, expensive context
+  switches. Blocking a thread (e.g. `Thread.sleep()`) truly parks it — the OS can't use it.
+- A **coroutine** is a Kotlin object. Suspending it costs a heap allocation (the `Continuation`)
+  and a few hundred bytes. You can have millions active simultaneously with no OS overhead.
+
+Three pieces make it work in practice:
+1. **`suspend` keyword** — marks a function that may suspend. The compiler rewrites it into a
+   state machine where each suspension point is a label; locals become fields on the generated class.
+2. **`CoroutineScope`** — the structured container that ties coroutine lifetimes to a lifecycle
+   (e.g. `viewModelScope`). When the scope is cancelled, all children are cancelled too.
+3. **`Dispatcher`** — decides *which thread(s)* run the coroutine after each resumption
+   (`Dispatchers.Main`, `Dispatchers.IO`, `Dispatchers.Default`).
+
+**Follow-up probes:**
+- *"If coroutines don't block threads, how does `delay(1000)` work?"* → `delay` is a suspend
+  function. It schedules a resumption after 1 second via a timer and immediately returns
+  `COROUTINE_SUSPENDED`, freeing the thread. No thread sleeps.
+- *"What's the difference between concurrency and parallelism in the context of coroutines?"* →
+  Coroutines on `Dispatchers.Main` achieve *concurrency* (interleaved progress, single thread) but
+  not *parallelism*. `Dispatchers.Default` can achieve *parallelism* by running coroutines on
+  multiple CPU cores simultaneously.
+- *"So is a coroutine a thread?"* → No. A thread is an OS concept; a coroutine is a Kotlin runtime
+  concept. One thread can run thousands of coroutines by switching between their `Continuation`s.
+
+**Red flag:** "A coroutine is a lightweight thread." Technically the docs say this, but stopping
+there shows the candidate has no model of *why* — no mention of suspension, `Continuation`, or
+the fact that no thread is blocked. A deeper candidate explains the mechanism, not the tagline.
+
+---
+
+### Q9: Every `viewModelScope.launch {}` block in `MoviesViewModel` and `MovieDetailViewModel` uses `catch (e: Exception)`. Why is swallowing `CancellationException` here a structural correctness bug, and what is the minimal fix?
+
+**What it probes:** Understanding that `CancellationException` is the cooperative cancellation
+*signal* — swallowing it breaks structured concurrency without throwing or crashing.
+
+**Strong answer:**
+- Kotlin coroutines use `CancellationException` as the mechanism for cooperative cancellation.
+  When a coroutine's `Job` is cancelled (e.g. `viewModelScope` cleared on ViewModel death), the
+  *next suspension point* inside the coroutine throws `CancellationException`. If `catch (e: Exception)`
+  catches it and doesn't re-throw, the coroutine **continues executing** past cancellation — it
+  escapes the structured cancellation contract.
+- Consequences: the coroutine may update `_state` after the ViewModel is cleared, hold resources
+  open that should be released, or run through expensive DB/network work that the system already
+  decided is no longer needed. No crash, no log — it just silently misbehaves.
+- **Minimal fix:** re-throw `CancellationException` before handling other errors:
+  ```kotlin
+  } catch (e: Exception) {
+      if (e is CancellationException) throw e
+      _state.update { it.copy(error = e.message) }
+  }
+  ```
+  Or replace `catch (e: Exception)` with typed catches (`catch (e: IOException)`,
+  `catch (e: HttpException)`) that structurally cannot match `CancellationException`.
+
+**Follow-up probes:**
+- *"Does `runCatching { }` have the same problem?"* → Yes — `runCatching` wraps everything in
+  `Result.failure`, so `CancellationException` gets stored instead of re-thrown. You need
+  `.onFailure { if (it is CancellationException) throw it }` after `runCatching`.
+- *"What about `catch (e: Throwable)`?"* → Same issue: `CancellationException` is a `Throwable`,
+  so it's caught and swallowed there too. Always re-throw it.
+- *"Is there a helper for this?"* → `ensureActive()` (from `CoroutineScope` or `currentCoroutineContext().ensureActive()`)
+  throws `CancellationException` if the coroutine is already cancelled — useful to call at the
+  start of a catch block or in a long computation loop.
+
+**Red flag ⚠️:** "It's fine — `catch (Exception)` is the standard pattern for error handling."
+This is a latent bug in the real codebase. The candidate who spots it without prompting has a
+meaningfully deeper model of coroutines than one who doesn't.
+
+---
+
+### Q10: `loadNextPage` currently runs `refreshPopularMovies(nextPage)` sequentially. Suppose we wanted to prefetch the next two pages in parallel. Why is `async`/`await` preferable to launching two `launch` coroutines, and what scope should the `async` blocks live in?
+
+**What it probes:** Concurrency primitives — `launch` vs `async`, result propagation, and the
+critical distinction between `coroutineScope` vs `viewModelScope` for structured parallel work.
+
+**Strong answer:**
+- `launch` returns a `Job` with no result. To run two calls in parallel and wait for both, you'd
+  `join()` both jobs — but if one throws, the exception is **not** re-thrown at the `join()` site;
+  it goes to the scope's uncaught handler. You lose the clean "fail fast, re-throw" behavior.
+- `async` returns a `Deferred<T>`; calling `.await()` suspends until the result is ready **and
+  re-throws any exception** that occurred inside. Failure surfaces exactly where you handle it:
+  ```kotlin
+  coroutineScope {
+      val d1 = async { repository.refreshPopularMovies(page) }
+      val d2 = async { repository.refreshPopularMovies(page + 1) }
+      d1.await()
+      d2.await()
+  }
+  ```
+- **Scope**: both `async` blocks must be children of a transient `coroutineScope { }` (or
+  `supervisorScope { }`), **not** launched directly on `viewModelScope`. That way they're tied to
+  the enclosing suspend function's lifetime — if `loadNextPage` is cancelled, both fetches cancel.
+  Launching on `viewModelScope` directly would make them outlive the calling function's
+  cancellation.
+- `coroutineScope` vs `supervisorScope` for the two `async` calls: `coroutineScope` cancels the
+  other async if one fails (fail-fast, sensible for page prefetch). `supervisorScope` keeps both
+  running independently (useful if partial results are still worth showing).
+
+**Follow-up probes:**
+- *"`coroutineScope { }` is itself a `suspend` function. What does it do to the parent coroutine
+  while the two `async` blocks run?"* → The parent suspends until *all* children inside
+  `coroutineScope` complete (or one fails). It's the structured "barrier" — the parent can't
+  proceed past `coroutineScope { }` until both fetches are done.
+- *"Could you call `d2.await()` before `d1.await()` without losing parallelism?"* → Yes —
+  both `async` blocks start immediately when launched; `.await()` just collects the result. Order
+  of awaiting doesn't affect when the work runs. But if `d1` threw and you check `d2.await()`
+  first, you'd get `d2`'s result before seeing `d1`'s exception. Usually you'd `awaitAll(d1, d2)`.
+
+**Red flag:** "Just `launch` both on `viewModelScope` — they run in parallel." Technically
+parallel, but misses exception re-throw semantics, result collection, and scope discipline.

@@ -27,6 +27,11 @@ Legend: ⚠️ = the question targets a real bug / limitation / smell in this co
 | `03_caching_flow_interview` | Q4 ⚠️ | `launchIn` collector has no `catch`; exception cancels whole scope | `MoviesViewModel.init` `.onEach{}.launchIn()` |
 | `03_caching_flow_interview` | Q5 | Keep transactions short; don't await network inside | `MovieRepositoryImpl.refreshPopularMovies` |
 | `03_caching_flow_interview` | Q6 ⚠️ | Search results never cached → cache-first degrades | `MovieRepositoryImpl.searchMovies`, `getMovieFromCache` |
+| `03_caching_flow_interview` | Q7 | Why Retrofit suspend calls don't need `withContext(Dispatchers.IO)` | `MovieRepositoryImpl.refreshPopularMovies`, `TmdbApi.kt` |
+| `03_caching_flow_interview` | Q8 | `SupervisorJob` in `viewModelScope`; sibling failure isolation | `MoviesViewModel` all `viewModelScope.launch` sites |
+| `03_caching_flow_interview` | Q9 ⚠️ | `catch (Exception)` swallows `CancellationException`; breaks cooperative cancellation | `MoviesViewModel:113,136,180`, `MovieDetailViewModel:65` |
+| `03_caching_flow_interview` | Q10 | `async`/`await` vs `launch` for parallel page prefetch; `coroutineScope` scoping | `MoviesViewModel.loadNextPage` |
+| `03_caching_flow_interview` | Q11 | What is a coroutine? suspension, `Continuation`, scope, dispatcher | Conceptual — no single file |
 | `04_compose_state_interview` | Q1 ⚠️ | `collectAsState` vs `collectAsStateWithLifecycle` | `MoviesScreen` `viewModel.state.collectAsState()` |
 | `04_compose_state_interview` | Q2 ⚠️ | `Movie` unstable via `List<Genre>?` → `MovieCard` never skips | `Movie.kt`, `MovieCard` in `MoviesScreen.kt` |
 | `04_compose_state_interview` | Q3 | `derivedStateOf` frequency mismatch; `snapshotFlow` alt | `MoviesScreen` `shouldLoadNextPage` |
